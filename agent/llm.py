@@ -1,77 +1,63 @@
 """
-LLM 客户端 — 对接 OpenAI 兼容 API。
+LLM 客户端 — 使用 OpenAI 官方 SDK。
 
-支持流式和非流式调用，统一接口。
+支持 function calling (tool use) 和流式输出。
 """
-import json
 import os
-
-import httpx
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessage
 
 
 DEFAULT_MODEL = "gpt-4o-mini"
-DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
-def _get_config() -> tuple[str, str, str]:
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    base_url = os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL)
-    model = os.environ.get("AGENT_MODEL", DEFAULT_MODEL)
-    return api_key, base_url, model
+def _create_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY", ""),
+        base_url=os.environ.get("OPENAI_BASE_URL", None),
+    )
 
 
-async def chat(messages: list[dict], temperature: float = 0.7) -> str:
-    """非流式调用 LLM，返回完整文本。"""
-    api_key, base_url, model = _get_config()
+def get_model() -> str:
+    return os.environ.get("AGENT_MODEL", DEFAULT_MODEL)
 
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
+
+async def chat(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    temperature: float = 0.7,
+) -> ChatCompletionMessage:
+    """非流式调用，返回 ChatCompletionMessage（含 tool_calls）。"""
+    client = _create_client()
+    kwargs = {
+        "model": get_model(),
         "messages": messages,
         "temperature": temperature,
     }
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
+    if tools:
+        kwargs["tools"] = tools
+    response = await client.chat.completions.create(**kwargs)
+    return response.choices[0].message
 
 
-async def chat_stream(messages: list[dict], temperature: float = 0.7):
-    """流式调用 LLM，yield 每个 token。"""
-    api_key, base_url, model = _get_config()
-
-    url = f"{base_url.rstrip('/')}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
+async def chat_stream(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    temperature: float = 0.7,
+):
+    """流式调用，yield (delta_content, tool_calls_delta, finish_reason)。"""
+    client = _create_client()
+    kwargs = {
+        "model": get_model(),
         "messages": messages,
         "temperature": temperature,
         "stream": True,
     }
+    if tools:
+        kwargs["tools"] = tools
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        async with client.stream("POST", url, headers=headers, json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    delta = chunk["choices"][0].get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
+    stream = await client.chat.completions.create(**kwargs)
+    async for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        finish = chunk.choices[0].finish_reason if chunk.choices else None
+        yield delta, finish
