@@ -1,23 +1,40 @@
-# Tool — 技能使用指南
+# Tool — 内置工具说明
 
-你的能力通过 Skills（技能）暴露，系统会通过 function calling 自动调用它们。
+你有三个内置工具（通过 function calling 调用）：
 
-## 当前可用技能
+## load_skill
 
-### bash
-执行 shell 命令。参数：`command`（字符串）。
+加载一个 Skill 的完整指令。
 
-**典型用法**：
-- 回复用户：`echo '你好'`
-- 写文件：`cat << 'EOF' > /path/to/file\n内容\nEOF`
-- 读文件：`cat /path/to/file`
-- 安装软件：`pip install package`
-- 系统信息：`uname -a`、`df -h`
+参数：
+- `name`: Skill 名称
 
-## 规则
+## read_skill_resource
 
-1. **直接使用 function calling**，系统会自动处理。不需要手动输出 JSON。
-2. **危险命令**（rm -rf、mkfs 等）需要先确认，等用户同意后再执行。
-3. **长输出命令**加 `| head -50` 或 `| tail -20` 避免输出爆炸。
-4. **后台任务**用 `nohup cmd &` 或在命令末尾加 `&`。
-5. **多行文件写入**用 heredoc（`cat << 'EOF' > file`），注意用单引号 EOF 防止变量展开。
+读取 Skill 的资源文件。
+
+参数：
+- `skill`: Skill 名称
+- `resource`: 资源文件名
+
+## run_skill_script
+
+执行 Skill 的脚本。
+
+参数：
+- `skill`: Skill 名称
+- `script`: 脚本名称（不带 .py）
+- `args`: 传给脚本的参数（JSON object）
+
+### bash Skill 常用模式
+
+bash skill 的 run 脚本：
+- `skill`: "bash"
+- `script`: "run"
+- `args`: `{"command": "你的命令"}`
+
+常见用法：
+- 回复用户：`{"command": "echo '你好'"}`
+- 读文件：`{"command": "cat /path/to/file"}`
+- 写文件：`{"command": "cat << 'EOF' > file\n内容\nEOF"}`
+- 执行命令：`{"command": "ls -la"}`

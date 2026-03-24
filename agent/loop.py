@@ -1,114 +1,105 @@
 """
 核心事件循环 — 中断驱动的 Agent Loop。
 
-永不停止。等待中断 → 识别渠道 → 调用 LLM (function calling) → 执行 Skill → 反馈 → 等待。
+永不停止。在终端收发消息。
+等待中断 → 调用 LLM (function calling) → 执行 Skill → 反馈 → 等待。
 """
 import asyncio
 import json
+from pathlib import Path
 
-from agent.interrupt import Interrupt, InterruptController, InterruptType
+from agent.interrupt import InterruptController, InterruptType
 from agent.message import MessageStore
-from agent.channels.base import Channel
+from agent.prompt import system_message
 from agent.scheduler import Scheduler
-from agent import llm, skill
-import agent.skills  # noqa: F401 — 触发 skill 注册
+from agent.skill import SkillsProvider, TOOLS, handle_tool_call
+from agent import llm
 
 
 MAX_TOOL_ROUNDS = 10
+SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
-class AgentLoop:
-    def __init__(self):
-        self.controller = InterruptController()
-        self.store = MessageStore()
-        self.scheduler = Scheduler(self.controller)
-        self._channels: dict[str, Channel] = {}
+async def run_loop():
+    """主循环：永不停止，中断驱动，终端交互。"""
+    provider = SkillsProvider(SKILLS_DIR)
 
-    def add_channel(self, channel: Channel):
-        self._channels[channel.name] = channel
+    controller = InterruptController()
+    scheduler = Scheduler(controller)
+    store = MessageStore()
+    store._system = system_message(provider.advertise_text())
 
-    def get_channel(self, name: str) -> Channel | None:
-        return self._channels.get(name)
+    listener_task = asyncio.create_task(controller.start_stdin_listener())
+    scheduler.start_all()
 
-    async def start(self):
-        for ch in self._channels.values():
-            await ch.start()
-        self.scheduler.start_all()
+    _print_cyan("[Agent] 已启动，等待输入... (Ctrl+C 退出)")
 
-        try:
-            await self._loop()
-        finally:
-            await self.stop()
-
-    async def stop(self):
-        self.scheduler.stop_all()
-        for ch in self._channels.values():
-            await ch.stop()
-
-    async def _loop(self):
+    try:
         while True:
-            interrupt = await self.controller.wait()
+            interrupt = await controller.wait()
 
             if interrupt.type == InterruptType.USER_INPUT:
-                await self._handle_user(interrupt)
+                _print_yellow(f"[中断] 用户输入")
+                try:
+                    await _handle_user(interrupt.payload, store, provider)
+                except Exception as e:
+                    _print_red(f"[错误] {e}")
+                _print_cyan("[Agent] 就绪，等待下一个中断...")
 
             elif interrupt.type == InterruptType.TIMER:
-                await self._handle_timer(interrupt)
+                data = interrupt.payload
+                prompt = data.get("data", "") if isinstance(data, dict) else str(data)
+                if prompt:
+                    try:
+                        await _handle_user(prompt, store, provider)
+                    except Exception as e:
+                        _print_red(f"[定时任务错误] {e}")
 
             elif interrupt.type == InterruptType.SIGNAL:
                 if interrupt.payload == "EOF":
+                    _print_cyan("[Agent] 检测到 EOF，退出。")
                     break
 
-    async def _handle_user(self, interrupt: Interrupt):
-        ch = self.get_channel(interrupt.channel)
-        sid = interrupt.session_id
+    except asyncio.CancelledError:
+        pass
+    finally:
+        scheduler.stop_all()
+        controller.stop()
+        listener_task.cancel()
         try:
-            await self._run_agent(sid, interrupt.payload, ch)
-        except Exception as e:
-            if ch:
-                await ch.send_text(sid, f"[错误] {e}")
+            await listener_task
+        except asyncio.CancelledError:
+            pass
 
-        if ch and hasattr(ch, "finish"):
-            await ch.finish(sid)
 
-    async def _handle_timer(self, interrupt: Interrupt):
-        """定时任务：payload.data 作为 prompt 发给 LLM。"""
-        data = interrupt.payload
-        job_name = data.get("job", "unknown")
-        prompt = data.get("data", f"Timer triggered: {job_name}")
-        if isinstance(prompt, str):
-            sid = f"timer_{job_name}"
-            await self._run_agent(sid, prompt, None)
+async def _handle_user(text: str, store: MessageStore, provider: SkillsProvider):
+    """处理一次输入：LLM → tool_calls → Skill 执行 → 循环。"""
+    store.add_user(text)
 
-    async def _run_agent(self, sid: str, user_text: str, ch: Channel | None):
-        """核心 Agent 调用循环：LLM → tool_calls → execute → feedback → repeat。"""
-        self.store.add_user(sid, user_text)
-        tools = skill.to_openai_tools()
+    for _ in range(MAX_TOOL_ROUNDS):
+        message = await llm.chat(store.to_messages(), tools=TOOLS)
 
-        for _ in range(MAX_TOOL_ROUNDS):
-            message = await llm.chat(self.store.to_messages(sid), tools=tools)
+        assistant_dict = _message_to_dict(message)
+        store.add_assistant(assistant_dict)
 
-            assistant_dict = _message_to_dict(message)
-            self.store.add_assistant(sid, assistant_dict)
+        if not message.tool_calls:
+            if message.content:
+                print(message.content, flush=True)
+            break
 
-            if not message.tool_calls:
-                if message.content and ch:
-                    await ch.send_text(sid, message.content)
-                break
+        for tc in message.tool_calls:
+            args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            cmd_display = args.get("command", args.get("name", tc.function.name))
+            _print_dim(f"$ [{tc.function.name}] {cmd_display}")
 
-            for tc in message.tool_calls:
-                result = await skill.execute(tc.function.name, tc.function.arguments)
+            result = await handle_tool_call(provider, tc.function.name, tc.function.arguments)
+            print(result, flush=True)
 
-                self.store.add_tool_result(sid, tc.id, result)
-
-                if ch:
-                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                    cmd = args.get("command", tc.function.name)
-                    await ch.send_tool_output(sid, tc.function.name, cmd, result)
+            store.add_tool_result(tc.id, result)
 
 
 def _message_to_dict(msg) -> dict:
-    """ChatCompletionMessage → dict，保留 tool_calls 信息。"""
+    """ChatCompletionMessage → dict，保留 tool_calls。"""
     d: dict = {"role": "assistant"}
     if msg.content:
         d["content"] = msg.content
@@ -125,3 +116,16 @@ def _message_to_dict(msg) -> dict:
             for tc in msg.tool_calls
         ]
     return d
+
+
+def _print_cyan(text: str):
+    print(f"\033[36m{text}\033[0m", flush=True)
+
+def _print_yellow(text: str):
+    print(f"\033[33m{text}\033[0m", flush=True)
+
+def _print_red(text: str):
+    print(f"\033[31m{text}\033[0m", flush=True)
+
+def _print_dim(text: str):
+    print(f"\033[90m{text}\033[0m", flush=True)
